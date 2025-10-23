@@ -17,10 +17,19 @@ T = 100.0  # Time horizon (s)
 
 # ==================== Data Generation ====================
 def inflow_density(t):
-    """Define time-varying inflow density at entrance (x=0)"""
-    rho_min = 0.010
-    rho_max = 0.035
-    rho_inflow = rho_min + (rho_max - rho_min) / (1 + np.exp(-0.1 * (t - T / 2)))
+    """
+    Define time-varying inflow density at entrance (x=0)
+    Gradually increases from low to high traffic
+    """
+    rho_min = 0.010  # Initial low density
+    rho_max = 0.035  # Maximum density at end
+
+    # Linear increase
+    rho_inflow = rho_min + (rho_max - rho_min) * (t / T)
+
+    # Alternative: Sigmoid smooth transition
+    rho_inflow = rho_min + (rho_max - rho_min) / (1 + np.exp(-0.1 * (t - T/2)))
+
     return np.clip(rho_inflow, 0.001, 0.1)
 
 
@@ -30,7 +39,10 @@ def generate_synthetic_data(nx=50, nt=50):
     t = np.linspace(0, T, nt)
     X, T_grid = np.meshgrid(x, t)
 
+    # Initial density distribution (low initial traffic)
     rho0 = 0.012 + 0.005 * np.sin(2 * np.pi * x / L)
+
+    # Use simplified numerical method to generate data
     rho = np.zeros((nt, nx))
     v = np.zeros((nt, nx))
 
@@ -42,34 +54,50 @@ def generate_synthetic_data(nx=50, nt=50):
 
     for n in range(nt - 1):
         for i in range(1, nx - 1):
+            # Constrain density range to avoid overflow
             rho[n, i] = np.clip(rho[n, i], 0.001, 0.1)
+
+            # LWR equation (flow conservation)
             drho_dt = -(rho[n, i] * v[n, i] - rho[n, i - 1] * v[n, i - 1]) / dx
+
+            # PW equation (velocity evolution)
             V_eq = v0 * np.exp(a_true * rho[n, i])
             dv_dx = (v[n, i + 1] - v[n, i - 1]) / (2 * dx)
+
+            # Compute pressure gradient with numerical protection
             rho_avg = np.maximum(rho[n, i], 1e-6)
             dP_dx = v0 ** 2 * a_true * np.exp(a_true * rho[n, i]) * (rho[n, i + 1] - rho[n, i - 1]) / (2 * dx)
+
             dv_dt = -v[n, i] * dv_dx - dP_dx / rho_avg + (V_eq - v[n, i]) / tau
 
+            # Update with smaller time step factor
             rho[n + 1, i] = np.clip(rho[n, i] + 0.5 * dt * drho_dt, 0.001, 0.1)
             v[n + 1, i] = np.clip(v[n, i] + 0.5 * dt * dv_dt, 0.1, v0)
 
+        # Boundary conditions - KEY MODIFICATION
+        # Inflow boundary (x=0): time-varying density
         current_time = t[n + 1]
         rho[n + 1, 0] = inflow_density(current_time)
-        v[n + 1, 0] = v0 * np.exp(a_true * rho[n + 1, 0])
+        v[n + 1, 0] = v0 * np.exp(a_true * rho[n + 1, 0])  # Equilibrium velocity at inflow
+
+        # Outflow boundary (x=L): free flow (Neumann condition)
         rho[n + 1, -1] = rho[n + 1, -2]
         v[n + 1, -1] = v[n + 1, -2]
 
+    # Add observation noise
     rho += np.random.normal(0, 0.0005, rho.shape)
     v += np.random.normal(0, 0.05, v.shape)
+
+    # Final clipping
     rho = np.clip(rho, 0.001, 0.1)
     v = np.clip(v, 0.1, v0)
 
     return X.flatten(), T_grid.flatten(), rho.flatten(), v.flatten()
 
 
-# ==================== IMPROVED PINN Model ====================
+# ==================== PINN Model ====================
 class TrafficPINN(nn.Module):
-    def __init__(self, layers=[2, 64, 64, 64, 64, 2]):
+    def __init__(self, layers=[2, 64, 64, 64, 2]):
         super(TrafficPINN, self).__init__()
         self.activation = nn.Tanh()
         self.linears = nn.ModuleList()
@@ -77,54 +105,20 @@ class TrafficPINN(nn.Module):
         for i in range(len(layers) - 1):
             self.linears.append(nn.Linear(layers[i], layers[i + 1]))
 
-        # Xavier initialization
-        for m in self.linears:
-            nn.init.xavier_normal_(m.weight)
-            nn.init.zeros_(m.bias)
-
-        # Learnable parameter a
+        # Learnable parameter a (initialized close to expected value)
         self.a = nn.Parameter(torch.tensor([-0.1], dtype=torch.float32))
 
-        # Normalization constants
-        self.register_buffer('x_mean', torch.tensor(L / 2, dtype=torch.float32))
-        self.register_buffer('x_std', torch.tensor(L / 2, dtype=torch.float32))
-        self.register_buffer('t_mean', torch.tensor(T / 2, dtype=torch.float32))
-        self.register_buffer('t_std', torch.tensor(T / 2, dtype=torch.float32))
-
-        # Output normalization
-        self.register_buffer('rho_mean', torch.tensor(0.02, dtype=torch.float32))
-        self.register_buffer('rho_std', torch.tensor(0.015, dtype=torch.float32))
-        self.register_buffer('v_mean', torch.tensor(9.9, dtype=torch.float32))
-        self.register_buffer('v_std', torch.tensor(0.15, dtype=torch.float32))
-
     def forward(self, x, t):
-        # Normalize inputs
-        x_norm = (x - self.x_mean) / self.x_std
-        t_norm = (t - self.t_mean) / self.t_std
-
-        inputs = torch.cat([x_norm, t_norm], dim=1)
+        inputs = torch.cat([x, t], dim=1)
         for i in range(len(self.linears) - 1):
             inputs = self.activation(self.linears[i](inputs))
         outputs = self.linears[-1](inputs)
-
-        # Apply activation and denormalization
-        # For density: use softplus to ensure positivity, then scale
-        rho_raw = outputs[:, 0:1]
-        rho = torch.nn.functional.softplus(rho_raw) * 0.01 + 0.005  # Range ~[0.005, inf), typical ~[0.01, 0.04]
-
-        # For velocity: use sigmoid to bound, then scale
-        v_raw = outputs[:, 1:2]
-        v = torch.sigmoid(v_raw) * (v0 - 0.1) + 0.1  # Range [0.1, 10]
-
-        return rho, v
+        return outputs[:, 0:1], outputs[:, 1:2]  # rho, v
 
 
-# ==================== IMPROVED Loss Function ====================
-def compute_loss(model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc,
-                 x_init, rho_init, v_init, x_boundary_in, t_boundary_in, rho_boundary_in):
-    """Improved loss with IC/BC enforcement"""
-
-    # 1. Data loss
+# ==================== Loss Function ====================
+def compute_loss(model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc):
+    # Data loss
     x_d = torch.tensor(x_data, dtype=torch.float32, requires_grad=True).reshape(-1, 1)
     t_d = torch.tensor(t_data, dtype=torch.float32, requires_grad=True).reshape(-1, 1)
     rho_pred, v_pred = model(x_d, t_d)
@@ -132,15 +126,14 @@ def compute_loss(model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc,
     rho_target = torch.tensor(rho_data, dtype=torch.float32).reshape(-1, 1)
     v_target = torch.tensor(v_data, dtype=torch.float32).reshape(-1, 1)
 
-    data_loss_rho = torch.mean((rho_pred - rho_target) ** 2)
-    data_loss_v = torch.mean((v_pred - v_target) ** 2)
-    data_loss = data_loss_rho + data_loss_v
+    data_loss = torch.mean((rho_pred - rho_target) ** 2) + torch.mean((v_pred - v_target) ** 2)
 
-    # 2. Physics loss (PDE residuals)
+    # Physics loss
     x_c = torch.tensor(x_colloc, dtype=torch.float32, requires_grad=True).reshape(-1, 1)
     t_c = torch.tensor(t_colloc, dtype=torch.float32, requires_grad=True).reshape(-1, 1)
     rho_c, v_c = model(x_c, t_c)
 
+    # Compute derivatives
     rho_t = torch.autograd.grad(rho_c, t_c, torch.ones_like(rho_c), create_graph=True)[0]
     rho_x = torch.autograd.grad(rho_c, x_c, torch.ones_like(rho_c), create_graph=True)[0]
     v_t = torch.autograd.grad(v_c, t_c, torch.ones_like(v_c), create_graph=True)[0]
@@ -159,71 +152,38 @@ def compute_loss(model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc,
 
     physics_loss = torch.mean(lwr_residual ** 2) + torch.mean(pw_residual ** 2)
 
-    # 3. Initial condition loss
-    x_ic = torch.tensor(x_init, dtype=torch.float32).reshape(-1, 1)
-    t_ic = torch.zeros_like(x_ic)
-    rho_ic_pred, v_ic_pred = model(x_ic, t_ic)
-
-    rho_ic_target = torch.tensor(rho_init, dtype=torch.float32).reshape(-1, 1)
-    v_ic_target = torch.tensor(v_init, dtype=torch.float32).reshape(-1, 1)
-
-    ic_loss = torch.mean((rho_ic_pred - rho_ic_target) ** 2) + torch.mean((v_ic_pred - v_ic_target) ** 2)
-
-    # 4. Boundary condition loss (inflow)
-    x_bc = torch.tensor(x_boundary_in, dtype=torch.float32).reshape(-1, 1)
-    t_bc = torch.tensor(t_boundary_in, dtype=torch.float32).reshape(-1, 1)
-    rho_bc_pred, v_bc_pred = model(x_bc, t_bc)
-
-    rho_bc_target = torch.tensor(rho_boundary_in, dtype=torch.float32).reshape(-1, 1)
-
-    bc_loss = torch.mean((rho_bc_pred - rho_bc_target) ** 2)
-
-    # Total loss with weights
-    total_loss = data_loss + 0.1 * physics_loss + 10.0 * ic_loss + 5.0 * bc_loss
-
-    return total_loss, data_loss, physics_loss, ic_loss, bc_loss
+    return data_loss + 1.0 * physics_loss, data_loss, physics_loss
 
 
-# ==================== IMPROVED Training ====================
-def train_pinn(model, x_data, t_data, rho_data, v_data, x_init, rho_init, v_init, epochs=10000):
+# ==================== Training ====================
+def train_pinn(model, x_data, t_data, rho_data, v_data, epochs=5000):
+    # Use different learning rates for network weights and parameter a
     optimizer = torch.optim.Adam([
         {'params': [p for n, p in model.named_parameters() if n != 'a'], 'lr': 0.001},
-        {'params': model.a, 'lr': 0.0005}
+        {'params': model.a, 'lr': 0.0001}  # Smaller learning rate for a
     ])
 
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.5)
-
-    # Generate collocation points
-    n_colloc = 2000
+    # Generate collocation points - FIXED: create arrays separately
+    n_colloc = 1000
     x_colloc = np.random.rand(n_colloc) * L
     t_colloc = np.random.rand(n_colloc) * T
 
-    # Boundary condition points (inflow at x=0)
-    n_bc = 100
-    t_boundary_in = np.linspace(0, T, n_bc)
-    x_boundary_in = np.zeros(n_bc)
-    rho_boundary_in = np.array([inflow_density(t) for t in t_boundary_in])
+    # Verify dimensions
+    print(f"Collocation points: x_colloc shape = {x_colloc.shape}, t_colloc shape = {t_colloc.shape}")
+    print(f"Data points: x_data shape = {x_data.shape}, t_data shape = {t_data.shape}")
 
     loss_history = []
     a_history = []
 
     for epoch in range(epochs):
         optimizer.zero_grad()
-
-        loss, data_loss, physics_loss, ic_loss, bc_loss = compute_loss(
-            model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc,
-            x_init, rho_init, v_init, x_boundary_in, t_boundary_in, rho_boundary_in
+        loss, data_loss, physics_loss = compute_loss(
+            model, x_data, t_data, rho_data, v_data, x_colloc, t_colloc
         )
-
         loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
-        scheduler.step()
 
-        # Constrain parameter a
+        # Constrain parameter a within reasonable range (wider range)
         with torch.no_grad():
             model.a.data = torch.clamp(model.a.data, -0.20, -0.01)
 
@@ -232,8 +192,8 @@ def train_pinn(model, x_data, t_data, rho_data, v_data, x_init, rho_init, v_init
 
         if (epoch + 1) % 500 == 0:
             print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.6f}, "
-                  f"Data: {data_loss.item():.6f}, Physics: {physics_loss.item():.6f}, "
-                  f"IC: {ic_loss.item():.6f}, BC: {bc_loss.item():.6f}, a: {model.a.item():.6f}")
+                  f"Data Loss: {data_loss.item():.6f}, Physics Loss: {physics_loss.item():.6f}, "
+                  f"a: {model.a.item():.6f}")
 
     return loss_history, a_history
 
@@ -242,6 +202,7 @@ def train_pinn(model, x_data, t_data, rho_data, v_data, x_init, rho_init, v_init
 def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_history):
     fig = plt.figure(figsize=(20, 14))
 
+    # Make predictions
     with torch.no_grad():
         x_test = torch.tensor(X, dtype=torch.float32).reshape(-1, 1)
         t_test = torch.tensor(T_grid, dtype=torch.float32).reshape(-1, 1)
@@ -249,22 +210,22 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
         rho_pred = rho_pred.numpy().flatten()
         v_pred = v_pred.numpy().flatten()
 
-    # 1-2. Density Fields
+    # 1. True vs Predicted Density Field
     ax1 = fig.add_subplot(3, 4, 1)
-    sc1 = ax1.scatter(X, T_grid, c=rho_true, cmap='jet', s=1, vmin=0.01, vmax=0.035)
+    sc1 = ax1.scatter(X, T_grid, c=rho_true, cmap='jet', s=1)
     ax1.set_xlabel('Position x (m)')
     ax1.set_ylabel('Time t (s)')
     ax1.set_title('True Density Field')
     plt.colorbar(sc1, ax=ax1, label='Density ρ')
 
     ax2 = fig.add_subplot(3, 4, 2)
-    sc2 = ax2.scatter(X, T_grid, c=rho_pred, cmap='jet', s=1, vmin=0.01, vmax=0.035)
+    sc2 = ax2.scatter(X, T_grid, c=rho_pred, cmap='jet', s=1)
     ax2.set_xlabel('Position x (m)')
     ax2.set_ylabel('Time t (s)')
     ax2.set_title('Predicted Density Field')
     plt.colorbar(sc2, ax=ax2, label='Density ρ')
 
-    # 3-4. Velocity Fields
+    # 2. True vs Predicted Velocity Field
     ax3 = fig.add_subplot(3, 4, 5)
     sc3 = ax3.scatter(X, T_grid, c=v_true, cmap='coolwarm', s=1)
     ax3.set_xlabel('Position x (m)')
@@ -279,19 +240,20 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
     ax4.set_title('Predicted Velocity Field')
     plt.colorbar(sc4, ax=ax4, label='Velocity v (m/s)')
 
-    # 5. Congestion Level
+    # 3. Congestion Level Analysis
     ax5 = fig.add_subplot(3, 4, 3)
-    congestion = np.clip(rho_pred / 0.035 * 100, 0, 100)
+    congestion = rho_pred / 0.1  # Normalized congestion level (assuming max density 0.1)
+    congestion = np.clip(congestion * 100, 0, 100)
     sc5 = ax5.scatter(X, T_grid, c=congestion, cmap='RdYlGn_r', s=1, vmin=0, vmax=100)
     ax5.set_xlabel('Position x (m)')
     ax5.set_ylabel('Time t (s)')
     ax5.set_title('Congestion Level (%)')
     plt.colorbar(sc5, ax=ax5, label='Congestion')
 
-    # 6. Speed-Density Relationship
+    # 4. Speed-Density Relationship
     ax6 = fig.add_subplot(3, 4, 7)
     ax6.scatter(rho_true, v_true, alpha=0.3, s=1, label='True Data')
-    rho_range = np.linspace(0.01, 0.035, 100)
+    rho_range = np.linspace(0, np.max(rho_true), 100)
     v_theoretical_true = v0 * np.exp(a_true * rho_range)
     v_theoretical_pred = v0 * np.exp(model.a.item() * rho_range)
     ax6.plot(rho_range, v_theoretical_true, 'r-', linewidth=2, label=f'True (a={a_true})')
@@ -302,31 +264,31 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
     ax6.legend()
     ax6.grid(True)
 
-    # 7. Training Loss
+    # 5. Training Loss Curve
     ax7 = fig.add_subplot(3, 4, 9)
     ax7.plot(loss_history)
-    ax7.set_xlabel('Epoch')
+    ax7.set_xlabel('Training Epoch')
     ax7.set_ylabel('Loss')
-    ax7.set_title('Training Loss')
+    ax7.set_title('Training Loss Curve')
     ax7.set_yscale('log')
     ax7.grid(True)
 
-    # 8. Parameter Convergence
+    # 6. Parameter a Convergence
     ax8 = fig.add_subplot(3, 4, 10)
     ax8.plot(a_history, label='Estimated a')
     ax8.axhline(y=a_true, color='r', linestyle='--', linewidth=2, label='True a')
-    ax8.set_xlabel('Epoch')
+    ax8.set_xlabel('Training Epoch')
     ax8.set_ylabel('Parameter a')
     ax8.set_title('Parameter a Convergence')
     ax8.legend()
     ax8.grid(True)
 
-    # 9. Average Congestion Over Time
+    # 7. Average Congestion Over Time
     ax9 = fig.add_subplot(3, 4, 11)
     nx = 50
     nt = 50
     rho_grid = rho_pred.reshape(nt, nx)
-    avg_congestion = np.mean(rho_grid, axis=1) / 0.035 * 100
+    avg_congestion = np.mean(rho_grid, axis=1) / 0.1 * 100
     t_axis = np.linspace(0, T, nt)
     ax9.plot(t_axis, avg_congestion, linewidth=2)
     ax9.fill_between(t_axis, 0, avg_congestion, alpha=0.3)
@@ -335,7 +297,7 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
     ax9.set_title('Average Yard Congestion Over Time')
     ax9.grid(True)
 
-    # 10. Inflow Density
+    # 8. NEW: Inflow Density Over Time
     ax10 = fig.add_subplot(3, 4, 4)
     t_inflow = np.linspace(0, T, 100)
     inflow_rho = [inflow_density(t) for t in t_inflow]
@@ -343,29 +305,26 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
     ax10.fill_between(t_inflow, 0, inflow_rho, alpha=0.3)
     ax10.set_xlabel('Time t (s)')
     ax10.set_ylabel('Inflow Density ρ')
-    ax10.set_title('Entrance Inflow Density')
+    ax10.set_title('Entrance Inflow Density (Increasing)')
     ax10.grid(True)
 
-    # 11. Entrance vs Exit Density
+    # 9. NEW: Entrance vs Exit Density Comparison
     ax11 = fig.add_subplot(3, 4, 8)
     rho_grid_true = rho_true.reshape(nt, nx)
-    t_boundary = np.linspace(0, T, nt)
-    entrance_density = rho_grid[:, 0]
-    exit_density = rho_grid[:, -1]
-    ax11.plot(t_boundary, entrance_density, linewidth=2, label='Predicted Entrance', color='red')
-    ax11.plot(t_boundary, exit_density, linewidth=2, label='Predicted Exit', color='green')
-    ax11.plot(t_boundary, rho_grid_true[:, 0], linewidth=1, linestyle='--', label='True Entrance', color='darkred',
-              alpha=0.7)
+    t_boundary = np.linspace(0, T, nt)  # Fixed: match the time steps
+    entrance_density = rho_grid_true[:, 0]
+    exit_density = rho_grid_true[:, -1]
+    ax11.plot(t_boundary, entrance_density, linewidth=2, label='Entrance (x=0)', color='red')
+    ax11.plot(t_boundary, exit_density, linewidth=2, label='Exit (x=L)', color='green')
     ax11.set_xlabel('Time t (s)')
     ax11.set_ylabel('Density ρ')
     ax11.set_title('Entrance vs Exit Density')
     ax11.legend()
     ax11.grid(True)
 
-    # 12. Flow Rate
+    # 10. NEW: Flow Rate Over Time
     ax12 = fig.add_subplot(3, 4, 12)
-    v_grid = v_pred.reshape(nt, nx)
-    flow_rate = np.mean(rho_grid * v_grid, axis=1)
+    flow_rate = np.mean(rho_grid_true * v_true.reshape(nt, nx), axis=1)  # Fixed: use true data for consistency
     ax12.plot(t_boundary, flow_rate, linewidth=2, color='purple')
     ax12.fill_between(t_boundary, 0, flow_rate, alpha=0.3)
     ax12.set_xlabel('Time t (s)')
@@ -374,37 +333,35 @@ def visualize_results(model, X, T_grid, rho_true, v_true, loss_history, a_histor
     ax12.grid(True)
 
     plt.tight_layout()
-    plt.savefig('traffic_pinn_results_improved.png', dpi=300, bbox_inches='tight')
+    plt.savefig('traffic_pinn_results.png', dpi=300, bbox_inches='tight')
     plt.show()
 
 
 # ==================== Main Program ====================
 if __name__ == "__main__":
     print("=" * 60)
-    print("Improved PINN-based Traffic Flow Parameter Estimation")
+    print("PINN-based Traffic Flow Parameter Estimation System")
     print("=" * 60)
     print(f"True parameter: a_true = {a_true}")
     print("=" * 60)
 
+    # Generate data
     print("\nGenerating synthetic data...")
     X, T_grid, rho_data, v_data = generate_synthetic_data(nx=50, nt=50)
-
-    # Extract initial conditions
-    nx = 50
-    x_init = np.linspace(0, L, nx)
-    rho_init = rho_data[:nx]
-    v_init = v_data[:nx]
-
     print(f"Number of data points: {len(X)}")
+    print(f"X shape: {X.shape}, T shape: {T_grid.shape}")
+    print(f"rho_data shape: {rho_data.shape}, v_data shape: {v_data.shape}")
 
-    print("\nCreating improved PINN model...")
+    # Create model
+    print("\nCreating PINN model...")
     model = TrafficPINN()
     print(f"Initial parameter a: {model.a.item():.6f}")
 
+    # Train
     print("\nStarting training...")
-    loss_history, a_history = train_pinn(model, X, T_grid, rho_data, v_data,
-                                         x_init, rho_init, v_init, epochs=10000)
+    loss_history, a_history = train_pinn(model, X, T_grid, rho_data, v_data, epochs=5000)
 
+    # Output results
     print("\n" + "=" * 60)
     print("Training completed!")
     print("=" * 60)
@@ -414,6 +371,7 @@ if __name__ == "__main__":
     print(f"Relative error: {abs(model.a.item() - a_true) / abs(a_true) * 100:.2f}%")
     print("=" * 60)
 
-    print("\nGenerating visualization...")
+    # Visualize
+    print("\nGenerating visualization results...")
     visualize_results(model, X, T_grid, rho_data, v_data, loss_history, a_history)
-    print("\nResults saved to 'traffic_pinn_results_improved.png'")
+    print("\nResults saved to 'traffic_pinn_results.png'")
